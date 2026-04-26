@@ -7,7 +7,7 @@ built on Alpine Linux. Same playbook as
 [`chefcai/bazarr-alpine`](https://github.com/chefcai/bazarr-alpine), and
 [`chefcai/sonarr-alpine`](https://github.com/chefcai/sonarr-alpine): the image
 is assembled in GitHub Actions and published to `ghcr.io`, so the eMMC-bound
-homelab host (`squirttle`, ~3.9 GB free) never holds intermediate build artifacts.
+homelab host (`squirttle`, ~3.7 GB free) never holds intermediate build artifacts.
 
 ## Image
 
@@ -18,15 +18,25 @@ ghcr.io/chefcai/radarr-alpine:<radarr-version>   # e.g. 6.1.1.10360
 
 ## Result
 
-| | Compressed pull (linux/amd64) | Δ vs upstream |
-|---|---:|---:|
-| `lscr.io/linuxserver/radarr:latest` (upstream, iter-0) | **88.6 MB** | — |
-| `ghcr.io/chefcai/radarr-alpine:latest` (iter-1) | **TBD after first build** | **TBD** |
+| | Compressed pull (linux/amd64) | On-disk (uncompressed) | Δ vs upstream |
+|---|---:|---:|---:|
+| `lscr.io/linuxserver/radarr:latest` (upstream) | **88.6 MB** | **209 MB** | — |
+| `ghcr.io/chefcai/radarr-alpine:latest`         | **74.1 MB** | **172 MB** | **−16.4 % (compressed)** / **−17.7 % (on-disk)** |
 
 > Compressed size is what `docker pull` actually transfers — the metric that
 > matters for squirttle's eMMC bandwidth/space. The GH workflow's "Report
 > final image size" step computes this from the OCI manifest after each push
 > and writes it into the run's job summary.
+
+**The 30 % reduction target in the brief was not achievable.** Radarr v6's
+self-contained tarball from GitHub Releases (~70 MB compressed) is the floor
+that all viable iterations share — same situation as sonarr-alpine. The savings
+vs upstream come almost entirely from dropping the `linuxserver/baseimage-alpine`
+layer (s6-overlay, bash, jq, curl, procps-ng, shadow, ca-certificates, docker-mods
+scripts) plus a few Radarr.Update / *.pdb / UI/*.map prunes. The ffprobe binary
+in the tarball is ~16 MB and would yield another ~9 MB compressed if removed,
+but that breaks Radarr's "Analyse video files" feature and is not enabled by
+default in `:latest` (documented as iter-2b below).
 
 ## Upstream tracking
 
@@ -41,9 +51,9 @@ on days Radarr hasn't released anything new.
 Homelab notes claimed the upstream Sonarr/Radarr images were "already efficient
 enough" not to be worth a custom build, in contrast to seerr/jellyfin/bazarr
 where chefcai/* saved hundreds of MB. sonarr-alpine re-validated that claim
-with measurements — there was a real win (~15.5%), smaller than the 50–60%
-wins elsewhere. radarr-alpine follows the same playbook and expects a similar
-savings band.
+with measurements — there was a real win (~15.5 %), smaller than the 50–60 %
+wins elsewhere. radarr-alpine follows the same playbook and lands at −16.4 %,
+confirming the pattern.
 
 The wins come from:
 - **Dropping the `linuxserver/baseimage-alpine` shell.** Upstream pulls in
@@ -61,19 +71,10 @@ The wins come from:
 - **`COMPlus_EnableDiagnostics=0`** — disables diagnostic sockets, saves RAM.
 
 **Key difference vs sonarr-alpine:** Radarr v6 uses **.NET 8** (sonarr-alpine
-tracks Sonarr v4 which uses .NET 6). The self-contained tarball bundles its
-own `NETCore.App 8.0.12 + AspNetCore.App 8.0.12`. Alpine 3.21 ships
-`dotnet8-runtime` in apk but Radarr doesn't distribute a framework-dependent
+tracks Sonarr v4 which uses .NET 6). The self-contained tarball bundles
+`NETCore.App 8.0.12 + AspNetCore.App 8.0.12`. Alpine 3.21 ships
+`dotnet8-runtime` in apk, but Radarr doesn't distribute a framework-dependent
 Linux build, so the self-contained tarball is the only option.
-
-## The 30% reduction target
-
-The same analysis applies here as for sonarr-alpine: **the 30% reduction target
-is not achievable.** The application layer floor is set by Radarr's bundled
-.NET 8 self-contained binary (~70–75 MB compressed), which we don't control.
-The only remaining lever is removing the bundled `ffprobe` binary (~16 MB),
-but that breaks Radarr's "Analyse video files" feature and is not enabled by
-default in `:latest` (documented as iter-2b below).
 
 ## Compose snippet
 
@@ -81,9 +82,12 @@ Replace the `radarr:` block in `~/arrs/docker-compose.yml`:
 
 ```yaml
 radarr:
+  # Slim Alpine-based Radarr (~74 MB vs upstream ~89 MB, -16.4%).
+  # Source: https://github.com/chefcai/radarr-alpine
   image: ghcr.io/chefcai/radarr-alpine:latest
+  #image: lscr.io/linuxserver/radarr:latest
   container_name: radarr
-  init: true          # Docker provides PID 1; no s6-overlay
+  init: true          # Docker provides PID 1; no s6-overlay in chefcai image
   logging:
     driver: json-file
     options:
@@ -120,16 +124,19 @@ Changes vs the LSIO block:
 ## Iteration log
 
 ### iter-0 — upstream baseline (lscr.io/linuxserver/radarr:latest)
-- **88.6 MB** compressed, 9 layers (linux/amd64, measured 2026-04-25)
-- Reference point. Not deployed.
+- **88.6 MB** compressed, **209 MB** on-disk (linux/amd64, measured 2026-04-26)
+- 9 layers. Reference point. Not deployed.
 
-### iter-1 — alpine:3.21 + self-contained tarball + safe prune (`Dockerfile`)
-- **TBD** — pending first build
-- Drops: baseimage-alpine shell + Radarr.Update + *.pdb + UI/*.map + ServiceInstall/Uninstall
-- APKs: icu-libs, tzdata, ca-certificates, libstdc++ (no sqlite-libs — bundled libe_sqlite3.so)
+### iter-1 — alpine:3.21 + self-contained tarball + safe prune (`Dockerfile`) ✅ current `:latest`
+- **74.1 MB** compressed, **172 MB** on-disk — **−16.4 % / −17.7 %** vs upstream
+- 4 layers. Deployed on squirttle 2026-04-26. `/ping` → `{"status":"OK"}`, healthcheck healthy.
+- Drops: `linuxserver/baseimage-alpine` shell layer + `Radarr.Update/` (245 files)
+  + `*.pdb` + `UI/*.map` (6 files) + `ServiceInstall` / `ServiceUninstall`
+- APKs: `icu-libs tzdata ca-certificates libstdc++` (no `sqlite-libs` — `libe_sqlite3.so` is bundled)
+- Version: 6.1.1.10360 (.NET 8 / NETCore.App 8.0.12)
 
-### iter-2b — ffprobe-free variant (not in `:latest`)
-- Would remove the bundled `ffprobe` binary (~16 MB uncompressed → ~9 MB compressed)
+### iter-2b — ffprobe-free variant (not in `:latest`, not deployed)
+- Would remove the bundled `ffprobe` binary (~16 MB uncompressed → ~9 MB compressed savings)
 - Breaks Radarr's "Analyse video files" / custom format video quality detection
-- Documented here as an option for deployments that don't use media analysis
-- Enable by adding `rm -f ffprobe` to the prune RUN step in the Dockerfile
+- Enable by adding `rm -f ffprobe` to the prune `RUN` step in `Dockerfile`
+- Expected size with ffprobe removed: ~65 MB compressed (−27 % vs upstream)
