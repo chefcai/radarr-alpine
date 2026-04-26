@@ -1,0 +1,216 @@
+name: Build and Push radarr-alpine Image
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      tag_suffix:
+        description: 'Optional suffix appended to the version tag (e.g. "iter2-debian"). When set, :latest is NOT updated.'
+        type: string
+        required: false
+        default: ''
+      measure_baseline:
+        description: 'Skip the build, just measure lscr.io/linuxserver/radarr:latest baseline.'
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    # Daily at 07:15 UTC. Staggered after bazarr-alpine (06:00),
+    # jellyfin-alpine (06:15), ttyd-alpine (06:30), seerr-alpine (06:45),
+    # sonarr-alpine (07:00).
+    # Skips automatically if the latest Radarr master version already has an
+    # image published — see "Check if image already exists".
+    - cron: '15 7 * * *'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+# Serialize runs on this ref. If a second run is queued while one is in-flight,
+# the older still-running job gets cancelled. Prevents the parallel-push :latest
+# race documented in feedback_gha_parallel_push_race.md.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  baseline:
+    name: Measure upstream linuxserver/radarr:latest (iter-0 baseline)
+    if: github.event_name == 'workflow_dispatch' && inputs.measure_baseline
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull manifest and report compressed size for lscr.io/linuxserver/radarr:latest
+        run: |
+          PKG="linuxserver/radarr"
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${PKG}:pull" | jq -r .token)
+          INDEX=$(curl -sSL \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.oci.image.index.v1+json" \
+            -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+            "https://ghcr.io/v2/${PKG}/manifests/latest")
+          AMD64_DIGEST=$(echo "$INDEX" | jq -r '.manifests[] | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest' | head -1)
+          if [ -z "$AMD64_DIGEST" ] || [ "$AMD64_DIGEST" = "null" ]; then
+            MANIFEST="$INDEX"
+          else
+            MANIFEST=$(curl -sSL \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+              -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+              "https://ghcr.io/v2/${PKG}/manifests/${AMD64_DIGEST}")
+          fi
+          COMPRESSED=$(echo "$MANIFEST" | jq '[.layers[].size] | add')
+          COMPRESSED_MB=$(echo "scale=1; $COMPRESSED / 1024 / 1024" | bc)
+          LAYERS=$(echo "$MANIFEST" | jq '.layers | length')
+          echo "::notice::lscr.io/linuxserver/radarr:latest (linux/amd64) compressed = ${COMPRESSED_MB} MB across ${LAYERS} layers"
+          echo "## iter-0 baseline" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: \`lscr.io/linuxserver/radarr:latest\` (linux/amd64)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Compressed size: **${COMPRESSED_MB} MB** across ${LAYERS} layers" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Manifest digest: \`${AMD64_DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Layer breakdown" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$MANIFEST" | jq -r '.layers[] | "\(.size / 1024 / 1024 * 10 | floor / 10) MB  \(.digest[7:19])  \(.mediaType)"' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  build-and-push:
+    name: Build radarr-alpine
+    if: github.event_name != 'workflow_dispatch' || !inputs.measure_baseline
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve latest Radarr master version from GitHub Releases
+        id: radarr_version
+        run: |
+          # GitHub Releases is the source of truth for Radarr master releases.
+          # The latest release tag is always the current stable build.
+          VERSION=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/Radarr/Radarr/releases/latest" \
+            | jq -r '.tag_name | ltrimstr("v")')
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "::error::Could not resolve latest Radarr version from GitHub Releases"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Radarr master latest: $VERSION"
+
+      - name: Determine tag suffix and latest-update flag
+        id: variant
+        run: |
+          SUFFIX="${{ inputs.tag_suffix }}"
+          # Tag scheme: pushes to main and scheduled runs publish :latest +
+          # :<version>. workflow_dispatch with a tag_suffix publishes only
+          # :<version>-<suffix> and does NOT touch :latest.
+          if [ -n "$SUFFIX" ]; then
+            VERSION_TAG="${{ steps.radarr_version.outputs.version }}-${SUFFIX}"
+            UPDATE_LATEST="false"
+          else
+            VERSION_TAG="${{ steps.radarr_version.outputs.version }}"
+            UPDATE_LATEST="true"
+          fi
+          echo "version_tag=$VERSION_TAG" >> "$GITHUB_OUTPUT"
+          echo "update_latest=$UPDATE_LATEST" >> "$GITHUB_OUTPUT"
+
+      - name: Check if image already exists for this version
+        id: check
+        run: |
+          TAG="${{ steps.variant.outputs.version_tag }}"
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${{ github.repository }}:pull" | jq -r .token)
+          HTTP=$(curl -sSL -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.oci.image.index.v1+json" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/${{ github.repository }}/manifests/$TAG")
+          if [ "$HTTP" = "200" ]; then
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Tag $TAG already exists — skipping build."
+          else
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Tag $TAG not yet published (HTTP $HTTP) — will build."
+          fi
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compose docker tags
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        id: tags
+        run: |
+          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.variant.outputs.version_tag }}"
+          if [ "${{ steps.variant.outputs.update_latest }}" = "true" ]; then
+            TAGS="$TAGS,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          fi
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Tags to push: $TAGS"
+
+      - name: Set up Docker Buildx
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            RADARR_VERSION=${{ steps.radarr_version.outputs.version }}
+            RADARR_BRANCH=master
+          cache-from: type=gha,scope=Dockerfile
+          cache-to: type=gha,mode=max,scope=Dockerfile
+
+      - name: Report final image size
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        run: |
+          # Pull the just-pushed manifest and sum compressed layer sizes.
+          # buildx with provenance attestations pushes an OCI image INDEX with
+          # two entries: the amd64 image and a buildx provenance attestation
+          # (platform=unknown/unknown). Resolve the index first to get the
+          # real amd64 layer sizes.
+          TAG="${{ steps.variant.outputs.version_tag }}"
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${{ github.repository }}:pull" | jq -r .token)
+          INDEX=$(curl -sSL \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/${{ github.repository }}/manifests/$TAG")
+          MEDIA=$(echo "$INDEX" | jq -r '.mediaType // empty')
+          if echo "$MEDIA" | grep -qE 'image\.index|manifest\.list'; then
+            AMD64=$(echo "$INDEX" | jq -r '.manifests[] | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest' | head -1)
+            MANIFEST=$(curl -sSL \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+              "https://ghcr.io/v2/${{ github.repository }}/manifests/$AMD64")
+          else
+            MANIFEST="$INDEX"
+          fi
+          COMPRESSED=$(echo "$MANIFEST" | jq '[.layers[].size] | add')
+          COMPRESSED_MB=$(echo "scale=1; $COMPRESSED / 1024 / 1024" | bc)
+          LAYERS=$(echo "$MANIFEST" | jq '.layers | length')
+          echo "::notice::radarr-alpine $TAG compressed = ${COMPRESSED_MB} MB across ${LAYERS} layers"
+          echo "## Image Size" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tag: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Compressed (linux/amd64): **${COMPRESSED_MB} MB** across ${LAYERS} layers" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Layer breakdown" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$MANIFEST" | jq -r '.layers[] | "\(.size / 1024 / 1024 * 10 | floor / 10) MB  \(.digest[7:19])"' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
