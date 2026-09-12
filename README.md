@@ -7,7 +7,7 @@ built on Alpine Linux. Same playbook as
 [`chefcai/bazarr-alpine`](https://github.com/chefcai/bazarr-alpine), and
 [`chefcai/sonarr-alpine`](https://github.com/chefcai/sonarr-alpine): the image
 is assembled in GitHub Actions and published to `ghcr.io`, so the eMMC-bound
-homelab host (`squirttle`, ~3.7 GB free) never holds intermediate build artifacts.
+small/resource-constrained homelab hosts never hold intermediate build artifacts.
 
 ## Image
 
@@ -24,7 +24,7 @@ ghcr.io/chefcai/radarr-alpine:<radarr-version>   # e.g. 6.1.1.10360
 | `ghcr.io/chefcai/radarr-alpine:latest`         | **74.1 MB** | **172 MB** | **−16.4 % (compressed)** / **−17.7 % (on-disk)** |
 
 > Compressed size is what `docker pull` actually transfers — the metric that
-> matters for squirttle's eMMC bandwidth/space. The GH workflow's "Report
+> matters on storage-constrained hosts. The GH workflow's "Report
 > final image size" step computes this from the OCI manifest after each push
 > and writes it into the run's job summary.
 
@@ -66,8 +66,9 @@ The wins come from:
 - **No `sqlite-libs`** — Radarr ships `libe_sqlite3.so`, which is
   System.Data.SQLite's self-contained amalgamation (no system libsqlite3
   dependency). Not needed in the base image.
-- **Fixed UID/GID baked in** (13001:13000). LSIO's `abc` user gets renumbered
-  at runtime; the chefcai image hardcodes the IDs and chowns at build.
+- **Configurable UID/GID via `PUID`/`PGID`** (default 1000:1000; remapped at
+  container start by `entrypoint.sh`, `su-exec`-based) — same runtime
+  behavior as LSIO's `abc` user, without the s6-overlay.
 - **`COMPlus_EnableDiagnostics=0`** — disables diagnostic sockets, saves RAM.
 
 **Key difference vs sonarr-alpine:** Radarr v6 uses **.NET 8** (sonarr-alpine
@@ -94,7 +95,7 @@ radarr:
       max-size: "10m"
       max-file: "3"
   environment:
-    - TZ=America/New_York
+    - TZ=UTC  # override to your local zone
   healthcheck:
     test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:7878/ping"]
     interval: 1m30s
@@ -104,7 +105,7 @@ radarr:
   ports:
     - "7878:7878"
   volumes:
-    - /home/haadmin/config/radarr-config:/config
+    - /path/to/radarr-config:/config
     - /mnt/Media/config/radarr/MediaCover:/config/MediaCover
     - /mnt/Media/config/radarr/Backups:/config/Backups
     - /mnt/Media/config/radarr/logs:/config/logs
@@ -117,7 +118,8 @@ radarr:
 Changes vs the LSIO block:
 - `image:` → `ghcr.io/chefcai/radarr-alpine:latest`
 - `init: true` added (no s6-overlay; Docker provides PID 1)
-- Drop `PUID=13001 / PGID=13000 / UMASK=002` env vars (UID baked in)
+- `PUID` / `PGID` env vars work directly (default 1000:1000 if unset);
+  `UMASK` is still unsupported (LSIO-only) — drop that one
 - Healthcheck: `wget` instead of `curl` (no curl in image); `/ping` endpoint
   instead of `/radarr/health` (works with any URL base, no auth required)
 
@@ -129,7 +131,7 @@ Changes vs the LSIO block:
 
 ### iter-1 — alpine:3.21 + self-contained tarball + safe prune (`Dockerfile`) ✅ current `:latest`
 - **74.1 MB** compressed, **172 MB** on-disk — **−16.4 % / −17.7 %** vs upstream
-- 4 layers. Deployed on squirttle 2026-04-26. `/ping` → `{"status":"OK"}`, healthcheck healthy.
+- 4 layers. Deployed 2026-04-26. `/ping` → `{"status":"OK"}`, healthcheck healthy.
 - Drops: `linuxserver/baseimage-alpine` shell layer + `Radarr.Update/` (245 files)
   + `*.pdb` + `UI/*.map` (6 files) + `ServiceInstall` / `ServiceUninstall`
 - APKs: `icu-libs tzdata ca-certificates libstdc++` (no `sqlite-libs` — `libe_sqlite3.so` is bundled)

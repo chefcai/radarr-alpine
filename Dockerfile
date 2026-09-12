@@ -2,7 +2,7 @@
 #
 # Pattern mirrors chefcai/jellyfin-alpine, chefcai/seerr-alpine,
 # chefcai/bazarr-alpine, chefcai/sonarr-alpine:
-#   - Build runs in GitHub Actions, not on squirttle's eMMC.
+#   - Build runs in GitHub Actions, not on the deploying host.
 #   - Final image is plain alpine + only the runtime artifacts needed
 #     to launch the app.
 #
@@ -52,7 +52,7 @@ RUN curl -fsSL \
  && tar xzf /work/radarr.tar.gz -C /work/radarr --strip-components=1 \
  && rm /work/radarr.tar.gz
 
-# Prune step — every byte counts on squirttle's 12 GB eMMC.
+# Prune step — every byte counts on storage-constrained hosts.
 # Numbers in parentheses are uncompressed sizes from the v6.1.1.10360
 # linux-musl-core-x64 tarball.
 #
@@ -122,14 +122,16 @@ ENV COMPlus_EnableDiagnostics=0 \
 # System.Data.SQLite's self-contained SQLite amalgamation — it does NOT
 # dlopen or link against the system libsqlite3.
 #
-# UID/GID 13001:13000 — homelab convention, matches sonarr/jellyfin/seerr-alpine.
-# Fixed at image build time so config-dir bind mounts already owned 13001:13000
-# on squirttle Just Work without runtime chown.
+# UID/GID 13001:13000 by default at build time (homelab convention, matches
+# sonarr/jellyfin/seerr-alpine) -- fully overridable at runtime via the
+# PUID/PGID env vars, see entrypoint.sh and
+# https://github.com/chefcai/radarr-alpine/issues/1
 RUN apk add --no-cache \
         icu-libs \
         tzdata \
         ca-certificates \
         libstdc++ \
+        su-exec \
  && addgroup -g 13000 radarr \
  && adduser -D -u 13001 -G radarr -h /config -s /sbin/nologin radarr \
  && mkdir -p /config /app /media \
@@ -137,7 +139,12 @@ RUN apk add --no-cache \
 
 COPY --from=fetch --chown=radarr:radarr /work/radarr /app/radarr/bin
 
-USER radarr
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# NOTE: intentionally stays as root here -- entrypoint.sh drops to
+# PUID:PGID (default 1000:1000) via su-exec at container start. See
+# https://github.com/chefcai/radarr-alpine/issues/1
 WORKDIR /app/radarr
 EXPOSE 7878
 
@@ -150,4 +157,5 @@ HEALTHCHECK --interval=1m30s --timeout=10s --retries=3 --start-period=60s \
 # Radarr's bundled AppHost binary launches the .NET 8 runtime and assembly.
 # `--data` points at the per-instance config dir (DB, indexer/profile XML,
 # logs). `--nobrowser` is a no-op in headless mode but signals intent.
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/app/radarr/bin/Radarr", "--data=/config", "--nobrowser"]

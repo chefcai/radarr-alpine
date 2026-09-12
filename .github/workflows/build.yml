@@ -3,6 +3,8 @@ name: Build and Push radarr-alpine Image
 on:
   push:
     branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
   workflow_dispatch:
     inputs:
       tag_suffix:
@@ -168,7 +170,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             RADARR_VERSION=${{ steps.radarr_version.outputs.version }}
@@ -177,7 +179,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=Dockerfile
 
       - name: Report final image size
-        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        if: github.event_name != 'pull_request' && (github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true')
         run: |
           # Pull the just-pushed manifest and sum compressed layer sizes.
           # buildx with provenance attestations pushes an OCI image INDEX with
