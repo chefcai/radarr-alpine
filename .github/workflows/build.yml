@@ -148,6 +148,19 @@ jobs:
             IS_DEFAULT_BRANCH="true"
           fi
 
+          # For a pull_request event, github.ref_name is the synthetic merge
+          # ref (e.g. "4/merge"), which contains a "/" and is not a valid
+          # Docker tag component on its own. Use the PR number instead; for
+          # any other non-default-branch event, fall back to the real branch
+          # name (github.head_ref for pull_request, github.ref_name
+          # otherwise) sanitized to tag-safe characters.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            REF_LABEL="pr-${{ github.event.number }}"
+          else
+            RAW_REF="${{ github.head_ref || github.ref_name }}"
+            REF_LABEL=$(echo "$RAW_REF" | tr '/' '-' | tr -cd 'a-zA-Z0-9_.-')
+          fi
+
           if [ -n "$SUFFIX" ]; then
             VERSION_TAG="${{ steps.radarr_version.outputs.version }}-${SUFFIX}"
             UPDATE_LATEST="false"
@@ -156,10 +169,11 @@ jobs:
             UPDATE_LATEST="true"
           else
             # No suffix given, but we're not on the default branch (e.g. a
-            # manual dispatch against a feature branch). Never touch :latest.
-            VERSION_TAG="${{ steps.radarr_version.outputs.version }}-${{ github.ref_name }}"
+            # manual dispatch against a feature branch, or a pull_request
+            # build). Never touch :latest.
+            VERSION_TAG="${{ steps.radarr_version.outputs.version }}-${REF_LABEL}"
             UPDATE_LATEST="false"
-            echo "::warning::workflow_dispatch on non-default branch '${{ github.ref_name }}' with no tag_suffix — tagging as '$VERSION_TAG' instead of touching :latest."
+            echo "::warning::Non-default-branch build ('${{ github.event_name }}', ref '${{ github.ref_name }}') with no tag_suffix — tagging as '$VERSION_TAG' instead of touching :latest."
           fi
 
           # Periodic base refresh: the weekly Sunday cron forces a rebuild
