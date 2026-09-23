@@ -24,6 +24,11 @@ on:
     # Skips automatically if the latest Radarr master version already has an
     # image published — see "Check if image already exists".
     - cron: '15 7 * * *'
+    # Weekly periodic base refresh, Sundays at 08:15 UTC. Forces a rebuild
+    # even when the current Radarr version is already published, so Alpine
+    # base-image and apk security patches land on a cadence instead of only
+    # when Radarr itself releases (see cross-cutting CI finding #2).
+    - cron: '15 8 * * 0'
 
 env:
   REGISTRY: ghcr.io
@@ -87,19 +92,39 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Resolve latest Radarr master version from GitHub Releases
         id: radarr_version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # GitHub Releases is the source of truth for Radarr master releases.
           # The latest release tag is always the current stable build.
-          VERSION=$(curl -fsSL \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/Radarr/Radarr/releases/latest" \
-            | jq -r '.tag_name | ltrimstr("v")')
-          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-            echo "::error::Could not resolve latest Radarr version from GitHub Releases"
+          # Authenticated (GH_TOKEN) requests get the 5000/hr rate limit
+          # instead of the 60/hr unauthenticated one, and we retry with
+          # backoff in case of a transient failure or rate limit (radarr-alpine
+          # hit an HTTP 522 from this same call pattern on prowlarr-alpine).
+          VERSION=""
+          for attempt in 1 2 3 4 5; do
+            RESPONSE=$(curl -sSL -w '\n%{http_code}' \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/Radarr/Radarr/releases/latest")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+            if [ "$HTTP_CODE" = "200" ]; then
+              VERSION=$(echo "$BODY" | jq -r '.tag_name | ltrimstr("v")')
+              if [ -n "$VERSION" ] && [ "$VERSION" != "null" ]; then
+                break
+              fi
+            fi
+            echo "::warning::Attempt $attempt failed to resolve Radarr version (HTTP $HTTP_CODE). Retrying..."
+            VERSION=""
+            sleep $((attempt * 5))
+          done
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not resolve latest Radarr version from GitHub Releases after 5 attempts"
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -112,15 +137,57 @@ jobs:
           # Tag scheme: pushes to main and scheduled runs publish :latest +
           # :<version>. workflow_dispatch with a tag_suffix publishes only
           # :<version>-<suffix> and does NOT touch :latest.
+          #
+          # is_default_branch guard: :latest is only ever updated when we're
+          # actually building off the default branch. A workflow_dispatch run
+          # against a feature branch with no tag_suffix used to fall through
+          # to update_latest=true and clobber :latest — that's the CI hazard
+          # this guard closes.
+          IS_DEFAULT_BRANCH="false"
+          if [ "${{ github.ref_name }}" = "${{ github.event.repository.default_branch }}" ]; then
+            IS_DEFAULT_BRANCH="true"
+          fi
+
+          # For a pull_request event, github.ref_name is the synthetic merge
+          # ref (e.g. "4/merge"), which contains a "/" and is not a valid
+          # Docker tag component on its own. Use the PR number instead; for
+          # any other non-default-branch event, fall back to the real branch
+          # name (github.head_ref for pull_request, github.ref_name
+          # otherwise) sanitized to tag-safe characters.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            REF_LABEL="pr-${{ github.event.number }}"
+          else
+            RAW_REF="${{ github.head_ref || github.ref_name }}"
+            REF_LABEL=$(echo "$RAW_REF" | tr '/' '-' | tr -cd 'a-zA-Z0-9_.-')
+          fi
+
           if [ -n "$SUFFIX" ]; then
             VERSION_TAG="${{ steps.radarr_version.outputs.version }}-${SUFFIX}"
             UPDATE_LATEST="false"
-          else
+          elif [ "$IS_DEFAULT_BRANCH" = "true" ]; then
             VERSION_TAG="${{ steps.radarr_version.outputs.version }}"
             UPDATE_LATEST="true"
+          else
+            # No suffix given, but we're not on the default branch (e.g. a
+            # manual dispatch against a feature branch, or a pull_request
+            # build). Never touch :latest.
+            VERSION_TAG="${{ steps.radarr_version.outputs.version }}-${REF_LABEL}"
+            UPDATE_LATEST="false"
+            echo "::warning::Non-default-branch build ('${{ github.event_name }}', ref '${{ github.ref_name }}') with no tag_suffix — tagging as '$VERSION_TAG' instead of touching :latest."
           fi
+
+          # Periodic base refresh: the weekly Sunday cron forces a rebuild
+          # even if this Radarr version was already published, so Alpine/apk
+          # security patches land on a cadence rather than only on app
+          # releases.
+          FORCE_REBUILD="false"
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "15 8 * * 0" ]; then
+            FORCE_REBUILD="true"
+          fi
+
           echo "version_tag=$VERSION_TAG" >> "$GITHUB_OUTPUT"
           echo "update_latest=$UPDATE_LATEST" >> "$GITHUB_OUTPUT"
+          echo "force_rebuild=$FORCE_REBUILD" >> "$GITHUB_OUTPUT"
 
       - name: Check if image already exists for this version
         id: check
@@ -132,17 +199,21 @@ jobs:
             -H "Accept: application/vnd.oci.image.index.v1+json" \
             -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
             "https://ghcr.io/v2/${{ github.repository }}/manifests/$TAG")
-          if [ "$HTTP" = "200" ]; then
+          if [ "$HTTP" = "200" ] && [ "${{ steps.variant.outputs.force_rebuild }}" != "true" ]; then
             echo "needs_build=false" >> "$GITHUB_OUTPUT"
             echo "::notice::Tag $TAG already exists — skipping build."
           else
             echo "needs_build=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Tag $TAG not yet published (HTTP $HTTP) — will build."
+            if [ "$HTTP" = "200" ]; then
+              echo "::notice::Tag $TAG already exists but this is the periodic base-refresh run — rebuilding anyway."
+            else
+              echo "::notice::Tag $TAG not yet published (HTTP $HTTP) — will build."
+            fi
           fi
 
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -161,12 +232,12 @@ jobs:
 
       - name: Set up Docker Buildx
         if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build and push Docker image
         if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -177,6 +248,36 @@ jobs:
             RADARR_BRANCH=master
           cache-from: type=gha,scope=Dockerfile
           cache-to: type=gha,mode=max,scope=Dockerfile
+
+      - name: Smoke test image (/ping)
+        if: github.event_name != 'pull_request' && (github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true')
+        run: |
+          # Boot the just-built/pushed image standalone and confirm it comes
+          # up and answers /ping before we call the run green. Nothing in
+          # this pipeline previously ran the image at all (cross-cutting CI
+          # finding #5).
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.variant.outputs.version_tag }}"
+          docker run -d --name radarr-smoke -p 7878:7878 "$IMAGE"
+
+          READY=""
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -L "http://localhost:7878/ping" || true)
+            if [ "$CODE" = "200" ]; then
+              READY="1"
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$READY" ]; then
+            echo "::error::radarr-alpine smoke test failed — /ping never returned 200"
+            docker logs radarr-smoke || true
+            docker rm -f radarr-smoke || true
+            exit 1
+          fi
+
+          echo "::notice::Smoke test passed — /ping returned 200"
+          docker rm -f radarr-smoke
 
       - name: Report final image size
         if: github.event_name != 'pull_request' && (github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true')
